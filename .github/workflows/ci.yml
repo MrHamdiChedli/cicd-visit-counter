@@ -1,0 +1,163 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+# Least privilege by default; jobs that need more ask for it.
+permissions:
+  contents: read
+
+env:
+  IMAGE: ghcr.io/mrhamdichedli/visit-counter
+  CI_TAG: visit-counter:ci
+  # Pinned by digest: in March 2026 attackers rewrote almost every trivy-action tag.
+  TRIVY: aquasec/trivy:0.76.1@sha256:790fd66d1697395d8693d1acaa1ea702406a20f109b6fc7bac8db623eca6c06c
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements-dev.txt
+      - name: Lint Python
+        run: ruff check .
+      - name: Lint the Dockerfile
+        uses: hadolint/hadolint-action@54c9adbab1582c2ef04b2016b760714a4bfde3cf # v3.1.0
+        with:
+          dockerfile: app/Dockerfile
+      - name: Lint shell scripts
+        run: shellcheck scripts/*.sh tests/*.sh
+
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: app
+          POSTGRES_PASSWORD: ci-only-password
+          POSTGRES_DB: appdb
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U app -d appdb"
+          --health-interval 5s --health-timeout 3s --health-retries 10
+    env:
+      DB_HOST: localhost
+      DB_PASSWORD: ci-only-password
+      PGPASSWORD: ci-only-password
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r app/requirements.txt -r requirements-dev.txt
+      - name: Create the schema
+        run: psql -h localhost -U app -d appdb -f app/schema.sql
+      - name: Unit and integration tests, coverage must stay above 90%
+        run: pytest --cov-fail-under=90
+
+  build:
+    needs: [lint, test]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write # to publish scan results in the Security tab
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: Build the image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: app
+          load: true
+          tags: ${{ env.CI_TAG }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Scan for vulnerabilities (report)
+        if: always()
+        run: >-
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v "$PWD:/out" "$TRIVY"
+          image --format sarif --output /out/trivy.sarif "$CI_TAG"
+      - name: Publish the report in the Security tab
+        if: always() && github.event_name == 'push'
+        uses: github/codeql-action/upload-sarif@a3d1b77a1ba1550fbb5c74db1dc3a11f4a481126 # v3
+        with:
+          sarif_file: trivy.sarif
+      - name: Block HIGH and CRITICAL vulnerabilities that have a fix
+        run: >-
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock "$TRIVY"
+          image --exit-code 1 --severity HIGH,CRITICAL --ignore-unfixed "$CI_TAG"
+
+      - name: Save the image for the next jobs
+        run: docker save "$CI_TAG" | gzip > image.tar.gz
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: image
+          path: image.tar.gz
+          retention-days: 3
+
+  integration:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: image
+      - run: gunzip -c image.tar.gz | docker load
+      - run: bash scripts/init-secrets.sh
+      - name: Start the stack with the scanned image
+        run: APP_IMAGE="$CI_TAG" docker compose up --detach --no-build --wait
+      - name: End-to-end test
+        run: bash tests/smoke-test.sh
+      - name: Show the logs if something failed
+        if: failure()
+        run: docker compose logs
+      - if: always()
+        run: docker compose down --volumes
+
+  publish:
+    # Only after every check passed, and never for pull requests.
+    needs: integration
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: image
+      - run: gunzip -c image.tar.gz | docker load
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Compute the tags
+        id: meta
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=sha
+            type=semver,pattern={{version}}
+            type=raw,value=latest,enable={{is_default_branch}}
+      # The pushed image is the one that was scanned and tested, not a rebuild.
+      - name: Push
+        run: |
+          while read -r tag; do
+            [ -n "$tag" ] || continue
+            docker tag "$CI_TAG" "$tag"
+            docker push "$tag"
+          done <<< "${{ steps.meta.outputs.tags }}"

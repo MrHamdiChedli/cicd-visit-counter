@@ -1,0 +1,66 @@
+name: visit-counter
+
+services:
+  lb:
+    image: nginx:1.27-alpine
+    ports:
+      - "8080:80"
+    volumes:
+      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+    networks: [frontend]
+    depends_on:
+      app:
+        condition: service_healthy
+    restart: unless-stopped
+
+  app:
+    build: ./app
+    # CI sets APP_IMAGE to the exact image it scanned, so the stack tests what will be published.
+    image: ${APP_IMAGE:-visit-counter:local}
+    deploy:
+      replicas: 2
+    environment:
+      DB_HOST: db
+      DB_PASSWORD_FILE: /run/secrets/db_password
+    secrets: [db_password]
+    networks: [frontend, backend]
+    depends_on:
+      db:
+        condition: service_healthy
+    # Hardening: nothing to write, no Linux capabilities, no way to gain privileges.
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped
+
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_DB: appdb
+      POSTGRES_PASSWORD_FILE: /run/secrets/db_password
+    secrets: [db_password]
+    volumes:
+      - db-data:/var/lib/postgresql/data
+      - ./app/schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro
+    networks: [backend]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d appdb"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+networks:
+  frontend:
+  # internal: no route outside Docker, and the load balancer isn't on it, so it can't reach the database.
+  backend:
+    internal: true
+
+volumes:
+  db-data:
+
+secrets:
+  db_password:
+    file: ./secrets/db_password.txt

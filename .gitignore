@@ -1,0 +1,13 @@
+# Vagrant's local state and VM images: machine-specific and very large
+.vagrant/
+*.box
+
+# Secrets never go in Git
+secrets/
+.env
+
+# Python
+__pycache__/
+venv/
+
+*.log

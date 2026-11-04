@@ -20,6 +20,17 @@ def test_healthz_is_ok_with_a_database(client):
     assert response.get_json() == {"status": "ok"}
 
 
+def test_the_app_creates_its_table_on_an_empty_database(client):
+    with visit_counter.connect() as conn, conn.cursor() as cur:
+        cur.execute("DROP TABLE IF EXISTS visits")
+    visit_counter._schema_ready = False
+
+    response = client.get("/")
+
+    assert response.status_code == 200
+    assert response.get_json()["visits"] == 1
+
+
 def test_each_visit_increments_the_shared_counter(client):
     first = client.get("/").get_json()
     second = client.get("/").get_json()

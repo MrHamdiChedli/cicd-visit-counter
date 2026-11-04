@@ -7,6 +7,9 @@ from flask import Flask, jsonify
 
 app = Flask(__name__)
 
+SCHEMA = "CREATE TABLE IF NOT EXISTS visits (id INTEGER PRIMARY KEY, total BIGINT NOT NULL)"
+_schema_ready = False
+
 
 def db_password():
     """Reads the password from a Docker secret file if one is given, else from the environment."""
@@ -27,10 +30,24 @@ def connect():
     )
 
 
+def ensure_schema(cur):
+    """Creates the table on first use, so a fresh database needs no separate setup step."""
+    global _schema_ready
+    if _schema_ready:
+        return
+    try:
+        cur.execute(SCHEMA)
+    except psycopg2.errors.UniqueViolation:
+        # Two replicas raced to create the table: the other one won, which is fine.
+        cur.connection.rollback()
+    _schema_ready = True
+
+
 @app.get("/")
 def index():
     """Counts the visit in the database and says which server answered."""
     with connect() as conn, conn.cursor() as cur:
+        ensure_schema(cur)
         cur.execute(
             "INSERT INTO visits (id, total) VALUES (1, 1) "
             "ON CONFLICT (id) DO UPDATE SET total = visits.total + 1 "

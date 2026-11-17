@@ -1,11 +1,11 @@
 # Stage 1: install the dependencies in a separate layer that is thrown away afterwards.
-FROM python:3.12-slim AS build
+FROM python:3.15-slim AS build
 WORKDIR /build
 COPY requirements.txt .
 RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
 
 # Stage 2: the runtime image only gets the installed packages and the code.
-FROM python:3.12-slim
+FROM python:3.15-slim
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 RUN useradd --system --uid 10001 --no-create-home app
